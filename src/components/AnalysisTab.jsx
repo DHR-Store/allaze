@@ -373,7 +373,7 @@ function AnalysisTab({ onAnalysisComplete }) {
           )}
         </div>
         <div className="col-md-6">
-          <label className="form-label fw-bold">Patient FASTA</label>
+          <label className="form-label fw-bold">Mutated FASTA</label>
           <input
             type="file"
             accept=".fasta,.fa,.txt,.seq"

@@ -5,7 +5,8 @@ import { getAminoAcidChange, getBaseContext } from '../utils/translation';
 import Protein2DView from './Protein2DView';
 import MutationGraph from './MutationGraph';
 
-function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSeq = '', settings }) {
+// FIX: Added 'organism' to the destructured props with a default of 'human'
+function StructureTab({ initialGene = '', organism = 'human', mutations = [], refSeq = '', patientSeq = '', settings }) {
   const [gene, setGene] = useState(initialGene);
   const [info, setInfo] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -23,30 +24,33 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
     document.head.appendChild(script);
   }, []);
 
-  // Fetch structure info when initialGene changes
+  // Fetch structure info when initialGene OR organism changes
   useEffect(() => {
     if (initialGene && initialGene !== 'Unknown') {
       setGene(initialGene);
-      fetchStructureInfo(initialGene);
+      fetchStructureInfo(initialGene, organism); // FIX: Pass organism here
     }
-  }, [initialGene]);
+  }, [initialGene, organism]); // FIX: Added organism to dependency array
 
-  const fetchStructureInfo = async (geneName) => {
+  // FIX: Updated to accept organismName parameter
+  const fetchStructureInfo = async (geneName, organismName) => {
     setLoading(true);
-    const data = await getSwissModelInfo(geneName);
+    // FIX: Pass the organism down to the API function
+    const data = await getSwissModelInfo(geneName, organismName);
     setInfo(data);
     setLoading(false);
   };
 
   const handleManualFetch = () => {
-    if (gene.trim()) fetchStructureInfo(gene.trim());
+    // FIX: Pass the current organism state when manually fetching
+    if (gene.trim()) fetchStructureInfo(gene.trim(), organism);
   };
 
   // Auto-select first available structure
   useEffect(() => {
     if (info && !info.error && info.structures?.length > 0 && !selectedPdbUrl) {
       const first = info.structures[0];
-      const pdbUrl = `https://swissmodel.expasy.org/repository/uniprot/${info.uniprot_id}.pdb?csm=${first.model_id}`;
+      const pdbUrl = `https://swissmodel.expasy.org/repository/uniprot/${info.uniprot_id || info.uniId}.pdb?csm=${first.model_id}`;
       setSelectedPdbUrl(pdbUrl);
     }
   }, [info, selectedPdbUrl]);
@@ -111,7 +115,7 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
   }, [selectedPdbUrl, mutations, refSeq, patientSeq, settings]);
 
   const handleStructureClick = (structure) => {
-    const pdbUrl = `https://swissmodel.expasy.org/repository/uniprot/${info.uniprot_id}.pdb?csm=${structure.model_id}`;
+    const pdbUrl = `https://swissmodel.expasy.org/repository/uniprot/${info.uniprot_id || info.uniId}.pdb?csm=${structure.model_id}`;
     setSelectedPdbUrl(pdbUrl);
   };
 
@@ -119,7 +123,7 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
   const mutationDetails = mutations.map(m => {
     let aaPos = m.aaPos;
     let refAA = m.refAA;
-    let altAA = m.patAA;
+    let altAA = m.patAA || m.altAA;
     let refCodon = m.refCodon;
     let patCodon = m.patCodon;
 
@@ -162,9 +166,9 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
           {loading && <p>Loading...</p>}
           {info && !info.error ? (
             <div>
-              <p><strong>{info.protein_name}</strong></p>
-              <p>UniProt: {info.uniprot_id}</p>
-              <p>Organism: {info.organism}</p>
+              <p><strong>{info.protein_name || gene}</strong></p>
+              <p>UniProt: {info.uniprot_id || info.uniId}</p>
+              <p>Organism: {info.organism || organism}</p>
               <p>Length: {info.length} aa</p>
               {mutations.length > 0 && (
                 <div className="alert alert-warning">
@@ -173,10 +177,10 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
               )}
               <h6>Structures ({info.structures?.length || 0})</h6>
               <ul className="list-group" style={{ maxHeight: '200px', overflowY: 'auto' }}>
-                {info.structures.length > 0 ? (
-                  info.structures.map(s => (
+                {info.structures && info.structures.length > 0 ? (
+                  info.structures.map((s, idx) => (
                     <li
-                      key={s.model_id || s.pdb_id}
+                      key={s.model_id || s.pdb_id || idx}
                       className="list-group-item"
                       onClick={() => handleStructureClick(s)}
                       style={{ cursor: 'pointer' }}
@@ -199,7 +203,7 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
                       className="btn btn-sm btn-outline-primary ms-2"
                       onClick={() => {
                         setGene(initialGene);
-                        fetchStructureInfo(initialGene);
+                        fetchStructureInfo(initialGene, organism);
                       }}
                     >
                       Use detected gene: {initialGene}
@@ -230,7 +234,7 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
                 proteinLength={lengthNum}
                 mutations={mutationDetails}
                 structures={info.structures}
-                uniprotId={info.uniprot_id}
+                uniprotId={info.uniprot_id || info.uniId}
               />
             </div>
           )}
