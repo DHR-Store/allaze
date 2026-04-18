@@ -3,15 +3,14 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { parseFasta, extractGeneAndOrganism, detectSequenceType } from '../utils/fastaParser';
 import { analyzeMutations } from '../api/alphamissense';
 import { getUniProtInfo, getCanonicalProtein } from '../api/uniprot';
-import { getAminoAcidChange, extractProtein, compareProteins } from '../utils/translation';
+import { getAminoAcidChange, extractProtein, compareProteins, findBestORF } from '../utils/translation';
 import { runBlast } from '../api/blast';
 
 const STORAGE_KEY = 'allaze_analysis_state';
-const MAX_NT_VARIANTS = 50;   // cap nucleotide-mode variants sent to APIs
+const MAX_NT_VARIANTS = 50;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Try to pull a gene symbol out of the top BLAST hit description. */
 function geneFromBlastHit(hit) {
   if (!hit?.description) return null;
   const m = hit.description.match(/\(([A-Z][A-Z0-9]{1,11})\)/);
@@ -21,7 +20,7 @@ function geneFromBlastHit(hit) {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 function AnalysisTab({ onAnalysisComplete }) {
-  // ── Persist / restore ───────────────────────────────────────────────────
+  // ── Persist / restore ────────────────────────────────────────────────────
   const loadSaved = () => {
     try {
       const s = localStorage.getItem(STORAGE_KEY);
@@ -34,22 +33,29 @@ function AnalysisTab({ onAnalysisComplete }) {
   const [patientSeq,    setPatientSeq]    = useState(saved?.patientSeq    || '');
   const [refHeader,     setRefHeader]     = useState(saved?.refHeader      || '');
   const [patientHeader, setPatientHeader] = useState(saved?.patientHeader  || '');
+  const [refSeqType,    setRefSeqType]    = useState(saved?.refSeqType     || '');
+  const [patSeqType,    setPatSeqType]    = useState(saved?.patSeqType     || '');
   const [results,       setResults]       = useState(saved?.results        || []);
   const [blastHits,     setBlastHits]     = useState(saved?.blastHits      || []);
   const [loading,       setLoading]       = useState(false);
   const [log,           setLog]           = useState(saved?.log            || 'Upload two FASTA files to begin.');
   const [geneInfo,      setGeneInfo]      = useState(saved?.geneInfo       || { gene: 'Unknown', organism: 'Unknown' });
-  const [mode,          setMode]          = useState(saved?.mode           || '');   // 'nucleotide' | 'protein'
+  const [mode,          setMode]          = useState(saved?.mode           || '');
   const [geneOverride,  setGeneOverride]  = useState('');
 
   // ── Persist & notify parent ──────────────────────────────────────────────
   useEffect(() => {
-    const state = { refSeq, patientSeq, refHeader, patientHeader, results, blastHits, log, geneInfo, mode };
+    const state = {
+      refSeq, patientSeq, refHeader, patientHeader,
+      refSeqType, patSeqType,
+      results, blastHits, log, geneInfo, mode,
+    };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     if ((results.length > 0 || blastHits.length > 0) && onAnalysisComplete) {
       onAnalysisComplete(geneInfo.gene, results, refSeq, patientSeq, blastHits);
     }
-  }, [refSeq, patientSeq, refHeader, patientHeader, results, blastHits, log, geneInfo, mode, onAnalysisComplete]);
+  }, [refSeq, patientSeq, refHeader, patientHeader, refSeqType, patSeqType,
+      results, blastHits, log, geneInfo, mode, onAnalysisComplete]);
 
   // ── File upload ──────────────────────────────────────────────────────────
   const handleFileUpload = (file, isRef) => {
@@ -59,10 +65,12 @@ function AnalysisTab({ onAnalysisComplete }) {
       const content = e.target.result;
       const { fullHeader, sequences } = parseFasta(content);
       const seq = sequences[0] || '';
+      const seqType = detectSequenceType(fullHeader, seq.length);
 
       if (isRef) {
         setRefHeader(fullHeader);
         setRefSeq(seq);
+        setRefSeqType(seqType);
         if (fullHeader) {
           const info = extractGeneAndOrganism(fullHeader);
           setGeneInfo(info);
@@ -70,7 +78,7 @@ function AnalysisTab({ onAnalysisComplete }) {
       } else {
         setPatientHeader(fullHeader);
         setPatientSeq(seq);
-        // Try to detect gene from patient header too (e.g., "patient_tp53_mutant")
+        setPatSeqType(seqType);
         if (fullHeader) {
           const patInfo = extractGeneAndOrganism(fullHeader);
           if (patInfo.gene !== 'Unknown') {
@@ -90,15 +98,29 @@ function AnalysisTab({ onAnalysisComplete }) {
   };
 
   // ── Detect comparison mode ───────────────────────────────────────────────
-  const detectMode = useCallback((ref, pat) => {
+  const detectMode = useCallback((ref, pat, rType, pType) => {
     if (!ref || !pat) return 'nucleotide';
+    // If types are explicitly known, use that instead of just the ratio
+    if (rType === 'cds' && pType === 'cds') return 'nucleotide';
+    if (rType === 'genomic' && pType === 'cds') return 'protein';
+    if (rType === 'cds' && pType === 'genomic') return 'protein';
+    if (rType === 'genomic' && pType === 'genomic') return 'nucleotide';
+    // Fall back to length ratio
     const ratio = ref.length / pat.length;
-    // Genomic vs CDS: reference >> patient (or very large reference)
     if (ratio > 3 || ratio < 0.33) return 'protein';
     return 'nucleotide';
   }, []);
 
-  const detectedMode = refSeq && patientSeq ? detectMode(refSeq, patientSeq) : '';
+  const detectedMode = refSeq && patientSeq
+    ? detectMode(refSeq, patientSeq, refSeqType, patSeqType)
+    : '';
+
+  // ── Genomic mismatch warning ─────────────────────────────────────────────
+  // True when one file is mRNA and the other is genomic (intron-containing).
+  const isSeqTypeMismatch =
+    refSeqType && patSeqType &&
+    ((refSeqType === 'cds' && patSeqType === 'genomic') ||
+     (refSeqType === 'genomic' && patSeqType === 'cds'));
 
   // ── Pipeline ─────────────────────────────────────────────────────────────
   const runAnalysis = async () => {
@@ -108,28 +130,54 @@ function AnalysisTab({ onAnalysisComplete }) {
 
     let { gene, organism } = geneInfo;
 
-    // Apply manual override if entered
     if (geneOverride.trim()) {
       gene = geneOverride.trim().toUpperCase();
       setGeneInfo(g => ({ ...g, gene }));
     }
 
-    const compMode = detectMode(refSeq, patientSeq);
+    const compMode = detectMode(refSeq, patientSeq, refSeqType, patSeqType);
     setMode(compMode);
 
     try {
       let variants = [];
 
-      // ════════════════════════════════════════════════════════════════════
-      // PROTEIN MODE  — reference is genomic or sequences are incompatible
-      // ════════════════════════════════════════════════════════════════════
+      // ══════════════════════════════════════════════════════════════════════
+      // PROTEIN MODE  — sequences are incompatible (different types/lengths)
+      // ══════════════════════════════════════════════════════════════════════
       if (compMode === 'protein') {
-        setLog('⚗️ Detected genomic reference vs CDS patient. Switching to protein comparison mode…');
 
-        // Step 1 – Translate patient CDS
-        const patientProtein = extractProtein(patientSeq);
+        if (isSeqTypeMismatch) {
+          setLog(
+            '⚠️ Sequence type mismatch detected: one file is mRNA/CDS and the other is genomic DNA. ' +
+            'Switching to protein comparison mode (results may be approximate for genomic patient sequences)…'
+          );
+        } else {
+          setLog('⚗️ Sequences have very different lengths. Switching to protein comparison mode…');
+        }
+
+        // Step 1 – Determine which sequence is the "patient CDS"
+        // If patient is genomic, we have to extract the best ORF
+        let patientProtein;
+
+        if (patSeqType === 'genomic') {
+          setLog(
+            '⚠️ Patient file is a GENOMIC sequence (contains introns — NC_ accession). ' +
+            'Extracting the longest open reading frame for approximate protein comparison. ' +
+            'For accurate results, please provide a patient CDS/mRNA (NM_ format).'
+          );
+          const { protein: orfProtein } = findBestORF(patientSeq);
+          patientProtein = orfProtein;
+        } else if (refSeqType === 'genomic') {
+          // Reference is genomic, patient is CDS — translate the patient CDS directly
+          patientProtein = extractProtein(patientSeq);
+        } else {
+          // Both unknown/cds — translate patient directly
+          patientProtein = extractProtein(patientSeq);
+        }
+
         if (!patientProtein) {
-          setLog('❌ Error: No start codon (ATG) found in patient sequence.');
+          setLog('❌ Error: Could not extract a protein from the patient sequence. ' +
+                 'Make sure the file contains a valid coding sequence with an ATG start codon.');
           setLoading(false);
           return;
         }
@@ -161,7 +209,8 @@ function AnalysisTab({ onAnalysisComplete }) {
         }
 
         // Step 3 – Fetch canonical reference protein from UniProt
-        const isMouseOrganism = organism.toLowerCase().includes('mus') || organism.toLowerCase().includes('mouse');
+        const isMouseOrganism =
+          organism.toLowerCase().includes('mus') || organism.toLowerCase().includes('mouse');
         const refProtein = await getCanonicalProtein(gene, isMouseOrganism ? 'mouse' : 'human');
 
         if (!refProtein) {
@@ -170,7 +219,14 @@ function AnalysisTab({ onAnalysisComplete }) {
           return;
         }
 
-        setLog(`📊 Reference protein: ${refProtein.length} aa · Patient protein: ${patientProtein.length} aa. Comparing…`);
+        setLog(
+          `📊 Reference protein: ${refProtein.length} aa · ` +
+          `Patient protein: ${patientProtein.length} aa. ` +
+          (patSeqType === 'genomic'
+            ? '⚠️ Patient protein extracted from genomic sequence (approximate). '
+            : '') +
+          'Comparing…'
+        );
 
         // Step 4 – Compare proteins
         const aaVariants = compareProteins(refProtein, patientProtein);
@@ -183,7 +239,7 @@ function AnalysisTab({ onAnalysisComplete }) {
 
         // Build variant objects (protein-mode shape)
         variants = aaVariants.map(v => ({
-          position:         v.aaPos,           // use aaPos as position for display
+          position:         v.aaPos,
           reference_allele: v.refAA,
           alternate_allele: v.patAA,
           gene,
@@ -198,13 +254,13 @@ function AnalysisTab({ onAnalysisComplete }) {
           mode:             'protein',
         }));
 
-        setLog(`Found ${variants.length} amino acid variant(s). Querying pathogenicity APIs (parallel)…`);
+        setLog(`Found ${variants.length} amino acid variant(s). Querying pathogenicity APIs…`);
 
-      // ════════════════════════════════════════════════════════════════════
-      // NUCLEOTIDE MODE  — sequences are compatible lengths
-      // ════════════════════════════════════════════════════════════════════
+      // ══════════════════════════════════════════════════════════════════════
+      // NUCLEOTIDE MODE  — sequences are compatible lengths / same type
+      // ══════════════════════════════════════════════════════════════════════
       } else {
-        setLog('Starting nucleotide-level analysis…');
+        setLog('🧬 Starting nucleotide-level analysis…');
         const rawVariants = [];
         const minLen = Math.min(refSeq.length, patientSeq.length);
 
@@ -229,17 +285,19 @@ function AnalysisTab({ onAnalysisComplete }) {
           }
         }
 
-        setLog(`Found ${rawVariants.length} nucleotide variant(s)${
-          rawVariants.length > MAX_NT_VARIANTS ? ` (showing top ${MAX_NT_VARIANTS})` : ''
-        }. Querying APIs in parallel…`);
+        setLog(
+          `Found ${rawVariants.length} nucleotide variant(s)` +
+          (rawVariants.length > MAX_NT_VARIANTS ? ` (showing top ${MAX_NT_VARIANTS})` : '') +
+          '. Querying APIs…'
+        );
 
-        variants = rawVariants; // analyzeMutations will cap internally
+        variants = rawVariants;
       }
 
-      // ── Step 5: AlphaMissense (parallel) ─────────────────────────────
+      // ── Step 5: AlphaMissense (parallel) ───────────────────────────────
       const enriched = await analyzeMutations(variants, MAX_NT_VARIANTS);
 
-      // ── Step 6: UniProt disease info (parallel) ───────────────────────
+      // ── Step 6: UniProt disease info (parallel) ─────────────────────────
       await Promise.all(
         enriched.map(async (v) => {
           if (
@@ -255,7 +313,7 @@ function AnalysisTab({ onAnalysisComplete }) {
 
       setResults(enriched);
 
-      // ── Step 7: BLAST (if not already run) ───────────────────────────
+      // ── Step 7: BLAST (if not already run) ─────────────────────────────
       if (blastHits.length === 0) {
         setLog(`✅ Analysis complete (${enriched.length} variant(s)). Running BLAST…`);
         try {
@@ -264,9 +322,19 @@ function AnalysisTab({ onAnalysisComplete }) {
             .substring(0, 2000);
           const hits = await runBlast(querySeq, gene !== 'Unknown' ? gene : null);
           setBlastHits(hits);
-          setLog(`✅ Pipeline complete — ${enriched.length} variant(s) · ${hits.length} BLAST hit(s).`);
+          setLog(
+            `✅ Pipeline complete — ${enriched.length} variant(s) · ${hits.length} BLAST hit(s).` +
+            (isSeqTypeMismatch
+              ? ' ⚠️ Note: patient was genomic DNA — protein comparison is approximate.'
+              : '')
+          );
         } catch (blastErr) {
-          setLog(`✅ Analysis complete (${enriched.length} variant(s)). BLAST unavailable.`);
+          setLog(
+            `✅ Analysis complete (${enriched.length} variant(s)). BLAST unavailable.` +
+            (isSeqTypeMismatch
+              ? ' ⚠️ Note: patient was genomic DNA — protein comparison is approximate.'
+              : '')
+          );
         }
       } else {
         setLog(`✅ Pipeline complete — ${enriched.length} variant(s) · ${blastHits.length} BLAST hit(s).`);
@@ -279,11 +347,12 @@ function AnalysisTab({ onAnalysisComplete }) {
     }
   };
 
-  // ── Clear ─────────────────────────────────────────────────────────────────
+  // ── Clear ────────────────────────────────────────────────────────────────
   const clearAll = () => {
     localStorage.removeItem(STORAGE_KEY);
     setRefSeq(''); setPatientSeq('');
     setRefHeader(''); setPatientHeader('');
+    setRefSeqType(''); setPatSeqType('');
     setResults([]); setBlastHits([]);
     setMode('');
     setLog('Upload two FASTA files to begin.');
@@ -291,7 +360,7 @@ function AnalysisTab({ onAnalysisComplete }) {
     setGeneOverride('');
   };
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ───────────────────────────────────────────────────────────────
   return (
     <div>
       {/* File upload row */}
@@ -308,8 +377,8 @@ function AnalysisTab({ onAnalysisComplete }) {
             <small className="text-success d-block mt-1">
               📌 Detected: <strong>{geneInfo.gene}</strong> ({geneInfo.organism})
               {refSeq && (
-                <span className="ms-2 badge bg-secondary">
-                  {detectSequenceType(refHeader, refSeq.length)} · {refSeq.length.toLocaleString()} bp
+                <span className={`ms-2 badge ${refSeqType === 'genomic' ? 'bg-warning text-dark' : 'bg-secondary'}`}>
+                  {refSeqType || detectSequenceType(refHeader, refSeq.length)} · {refSeq.length.toLocaleString()} bp
                 </span>
               )}
             </small>
@@ -324,11 +393,11 @@ function AnalysisTab({ onAnalysisComplete }) {
             onChange={e => handleFileUpload(e.target.files[0], false)}
           />
           {patientHeader && (
-            <small className="text-success d-block mt-1">
-              Loaded: {patientHeader.replace(/^>/, '').substring(0, 60)}
+            <small className={`d-block mt-1 ${patSeqType === 'genomic' ? 'text-warning' : 'text-success'}`}>
+              {patSeqType === 'genomic' ? '⚠️' : '✅'} Loaded: {patientHeader.replace(/^>/, '').substring(0, 60)}
               {patientSeq && (
-                <span className="ms-2 badge bg-secondary">
-                  {detectSequenceType(patientHeader, patientSeq.length)} · {patientSeq.length.toLocaleString()} bp
+                <span className={`ms-2 badge ${patSeqType === 'genomic' ? 'bg-warning text-dark' : 'bg-secondary'}`}>
+                  {patSeqType || detectSequenceType(patientHeader, patientSeq.length)} · {patientSeq.length.toLocaleString()} bp
                 </span>
               )}
             </small>
@@ -336,15 +405,29 @@ function AnalysisTab({ onAnalysisComplete }) {
         </div>
       </div>
 
+      {/* ── Genomic patient warning ── */}
+      {patSeqType === 'genomic' && (
+        <div className="alert alert-warning py-2 mb-2">
+          <strong>⚠️ Genomic patient sequence detected (NC_ accession)</strong>
+          <br />
+          Your patient file is a full <strong>genomic DNA region</strong> that includes introns.
+          The pipeline will translate the best available open reading frame (ORF) for protein comparison,
+          but the results will be <strong>approximate</strong> — introns disrupt the reading frame.
+          <br />
+          <span className="text-muted">
+            For accurate variant analysis, provide a patient <strong>CDS or mRNA sequence</strong> (NM_ format, e.g. exported from NCBI RefSeq or a transcript aligner).
+          </span>
+        </div>
+      )}
+
       {/* Mode badge */}
       {refSeq && patientSeq && (
         <div className="mb-2">
           {detectedMode === 'protein' ? (
             <div className="alert alert-warning py-2 mb-2">
-              <strong>⚗️ Protein Comparison Mode</strong> — Reference is genomic (
-              {refSeq.length.toLocaleString()} bp) and patient appears to be CDS (
-              {patientSeq.length.toLocaleString()} bp). The pipeline will translate the patient sequence
-              and compare against the canonical reference protein from UniProt.
+              <strong>⚗️ Protein Comparison Mode</strong> — Sequences have incompatible types or lengths (
+              {refSeq.length.toLocaleString()} bp vs {patientSeq.length.toLocaleString()} bp).
+              The pipeline will compare against the canonical reference protein from UniProt.
             </div>
           ) : (
             <div className="alert alert-success py-2 mb-2">
@@ -356,19 +439,24 @@ function AnalysisTab({ onAnalysisComplete }) {
         </div>
       )}
 
-      {/* Gene override when gene unknown */}
-      {refSeq && geneInfo.gene === 'Unknown' && (
-        <div className="alert alert-warning d-flex align-items-center gap-2 py-2 mb-2">
-          <span>⚠️ Gene not auto-detected.</span>
+      {/* Gene override — always shown when sequences are loaded */}
+      {refSeq && patientSeq && (
+        <div className="mb-2 d-flex align-items-center gap-2">
+          <label className="form-label mb-0 fw-semibold text-nowrap">Gene symbol:</label>
           <input
             type="text"
-            className="form-control form-control-sm"
+            className={`form-control form-control-sm ${geneInfo.gene === 'Unknown' ? 'border-warning' : ''}`}
             style={{ maxWidth: 160 }}
-            placeholder="Enter gene (e.g. TP53)"
+            placeholder={geneInfo.gene !== 'Unknown' ? geneInfo.gene : 'e.g. TP53'}
             value={geneOverride}
             onChange={e => setGeneOverride(e.target.value)}
           />
-          <small className="text-muted">Required for protein mode</small>
+          {geneInfo.gene !== 'Unknown' && !geneOverride && (
+            <small className="text-muted">Auto-detected: <strong>{geneInfo.gene}</strong> · Override if incorrect</small>
+          )}
+          {geneInfo.gene === 'Unknown' && (
+            <small className="text-warning">⚠️ Gene not auto-detected — required for protein mode</small>
+          )}
         </div>
       )}
 
@@ -392,7 +480,11 @@ function AnalysisTab({ onAnalysisComplete }) {
       </div>
 
       {/* Log */}
-      <div className={`alert ${log.startsWith('❌') ? 'alert-danger' : log.startsWith('⚠️') ? 'alert-warning' : 'alert-info'}`}>
+      <div className={`alert ${
+        log.startsWith('❌') ? 'alert-danger' :
+        log.startsWith('⚠️') ? 'alert-warning' :
+        'alert-info'
+      }`}>
         {loading && <span className="spinner-border spinner-border-sm me-2" />}
         {log}
       </div>
@@ -404,6 +496,9 @@ function AnalysisTab({ onAnalysisComplete }) {
             🧬 Variant Analysis Results
             {mode === 'protein' && (
               <span className="badge bg-info text-dark ms-2 fs-6">Protein Mode</span>
+            )}
+            {patSeqType === 'genomic' && (
+              <span className="badge bg-warning text-dark ms-2 fs-6">⚠️ Approximate (Genomic Patient)</span>
             )}
           </h5>
           <div className="table-responsive">
@@ -442,9 +537,10 @@ function AnalysisTab({ onAnalysisComplete }) {
                     </td>
                     <td>
                       <span className={`badge ${
-                        v.classification?.includes('Pathogenic') ? 'bg-danger'   :
-                        v.classification?.includes('Benign')     ? 'bg-success'  :
-                        v.classification?.includes('Error')      ? 'bg-secondary':
+                        v.classification?.includes('Pathogenic') ? 'bg-danger'    :
+                        v.classification?.includes('Benign')     ? 'bg-success'   :
+                        v.classification?.includes('database')   ? 'bg-secondary' :
+                        v.classification?.includes('Error')      ? 'bg-secondary' :
                                                                    'bg-warning text-dark'
                       }`}>
                         {v.classification}
@@ -477,8 +573,11 @@ function AnalysisTab({ onAnalysisComplete }) {
                   <tr key={i}>
                     <td>{i + 1}</td>
                     <td>
-                      <a href={`https://www.ncbi.nlm.nih.gov/nuccore/${h.accession}`}
-                         target="_blank" rel="noreferrer">
+                      <a
+                        href={`https://www.ncbi.nlm.nih.gov/nuccore/${h.accession}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
                         <code>{h.accession}</code>
                       </a>
                     </td>
