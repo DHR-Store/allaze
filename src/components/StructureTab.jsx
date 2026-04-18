@@ -1,20 +1,20 @@
+// components/StructureTab.jsx
 import React, { useState, useEffect, useRef } from 'react';
 import { getSwissModelInfo } from '../api/swissmodel';
 import { getAminoAcidChange, getBaseContext } from '../utils/translation';
-import { Bar } from 'react-chartjs-2';
-import { Chart as ChartJS, CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend } from 'chart.js';
+import Protein2DView from './Protein2DView';
+import MutationGraph from './MutationGraph';
 
-ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
-
-function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSeq = '' }) {
+function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSeq = '', settings }) {
   const [gene, setGene] = useState(initialGene);
   const [info, setInfo] = useState(null);
   const [loading, setLoading] = useState(false);
   const [selectedPdbUrl, setSelectedPdbUrl] = useState('');
+  const [pickedResidue, setPickedResidue] = useState(null);
   const viewerRef = useRef(null);
   const stageRef = useRef(null);
 
-  // Load NGL script
+  // Load NGL script dynamically
   useEffect(() => {
     if (window.NGL) return;
     const script = document.createElement('script');
@@ -23,7 +23,7 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
     document.head.appendChild(script);
   }, []);
 
-  // Fetch when initialGene changes
+  // Fetch structure info when initialGene changes
   useEffect(() => {
     if (initialGene && initialGene !== 'Unknown') {
       setGene(initialGene);
@@ -42,7 +42,7 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
     if (gene.trim()) fetchStructureInfo(gene.trim());
   };
 
-  // Auto‑select first structure when info loads
+  // Auto-select first available structure
   useEffect(() => {
     if (info && !info.error && info.structures?.length > 0 && !selectedPdbUrl) {
       const first = info.structures[0];
@@ -51,7 +51,7 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
     }
   }, [info, selectedPdbUrl]);
 
-  // Initialize NGL when PDB URL changes
+  // Initialize NGL stage with picking support
   useEffect(() => {
     if (!selectedPdbUrl || !viewerRef.current || !window.NGL) return;
 
@@ -59,20 +59,46 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
       if (stageRef.current) stageRef.current.dispose();
       const stage = new window.NGL.Stage(viewerRef.current, { backgroundColor: 'black' });
       stageRef.current = stage;
+
+      // Handle residue picking
+      stage.signals.clicked.add((pickingProxy) => {
+        if (pickingProxy && pickingProxy.atom) {
+          const atom = pickingProxy.atom;
+          const residue = atom.resname + ' ' + atom.resno;
+          setPickedResidue(residue);
+        } else {
+          setPickedResidue(null);
+        }
+      });
+
       try {
         const comp = await stage.loadFile(selectedPdbUrl, { defaultRepresentation: true });
-        comp.addRepresentation('cartoon', { color: 'white' });
 
-        // Highlight mutations (amino acid positions)
-        if (mutations.length > 0 && refSeq && patientSeq) {
+        // Apply representation from settings
+        const repType = settings.representation || 'cartoon';
+        const colorScheme = settings.colorScheme || 'chain';
+        comp.addRepresentation(repType, { color: colorScheme });
+
+        // Highlight mutations
+        if (settings.showMutations && mutations.length > 0 && refSeq && patientSeq) {
           const aaPositions = mutations
-            .map(m => getAminoAcidChange(refSeq, patientSeq, m.position).aaPos)
+            .map(m => {
+              // Use the stored aaPos if available; otherwise compute
+              if (m.aaPos) return m.aaPos;
+              const change = getAminoAcidChange(
+                refSeq, patientSeq, m.position,
+                m.reference_allele, m.alternate_allele
+              );
+              return change.aaPos;
+            })
             .filter(p => p && !isNaN(p));
           const uniquePositions = [...new Set(aaPositions)];
           if (uniquePositions.length > 0) {
             const selection = uniquePositions.join(' or ');
             comp.addRepresentation('spacefill', { sele: selection, color: 'red', radius: 0.3 });
-            comp.addRepresentation('label', { sele: selection, labelType: 'resid', color: 'yellow', scale: 1.2 });
+            if (settings.showLabels) {
+              comp.addRepresentation('label', { sele: selection, labelType: 'resid', color: 'yellow', scale: 1.2 });
+            }
           }
         }
         comp.autoView();
@@ -82,53 +108,51 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
       }
     };
     initNGL();
-  }, [selectedPdbUrl, mutations, refSeq, patientSeq]);
+  }, [selectedPdbUrl, mutations, refSeq, patientSeq, settings]);
 
   const handleStructureClick = (structure) => {
     const pdbUrl = `https://swissmodel.expasy.org/repository/uniprot/${info.uniprot_id}.pdb?csm=${structure.model_id}`;
     setSelectedPdbUrl(pdbUrl);
   };
 
-  // Prepare mutation details with AA change and base context
+  // Prepare mutation details (using stored AA data if available, otherwise compute)
   const mutationDetails = mutations.map(m => {
-    const aaChange = (refSeq && patientSeq) ? getAminoAcidChange(refSeq, patientSeq, m.position) : null;
+    let aaPos = m.aaPos;
+    let refAA = m.refAA;
+    let altAA = m.patAA;
+    let refCodon = m.refCodon;
+    let patCodon = m.patCodon;
+
+    // If any AA info missing, recompute
+    if (!aaPos || !refAA || !altAA) {
+      const change = getAminoAcidChange(
+        refSeq, patientSeq, m.position,
+        m.reference_allele, m.alternate_allele
+      );
+      aaPos = change.aaPos;
+      refAA = change.refAA;
+      altAA = change.patAA;
+      refCodon = change.refCodon;
+      patCodon = change.patCodon;
+    }
+
     const contextRef = refSeq ? getBaseContext(refSeq, m.position, 5) : '';
-    const contextPat = patientSeq ? getBaseContext(patientSeq, m.position, 5) : '';
     return {
       ...m,
-      aaPos: aaChange?.aaPos || '?',
-      refAA: aaChange?.refAA || '?',
-      altAA: aaChange?.patAA || '?',
-      refCodon: aaChange?.refCodon || '?',
-      patCodon: aaChange?.patCodon || '?',
+      aaPos,
+      refAA,
+      altAA,
+      refCodon: refCodon || (m.reference_allele?.length === 1 ? 'SNP' : 'INDEL'),
+      patCodon: patCodon || (m.alternate_allele?.length === 1 ? 'SNP' : 'INDEL'),
       contextRef,
-      contextPat
     };
   });
 
-  // Chart data
-  const chartData = {
-    labels: mutationDetails.map(m => `${m.gene} ${m.aaPos !== '?' ? m.aaPos : m.position}`),
-    datasets: [{
-      label: 'AlphaMissense Score',
-      data: mutationDetails.map(m => typeof m.am_score === 'number' ? m.am_score : 0),
-      backgroundColor: 'rgba(54, 162, 235, 0.6)',
-      borderColor: 'rgba(54, 162, 235, 1)',
-      borderWidth: 1
-    }]
-  };
-
-  const chartOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: { position: 'top' },
-      title: { display: true, text: 'Mutation Pathogenicity Scores' }
-    },
-    scales: {
-      y: { beginAtZero: true, max: 1.0, title: { display: true, text: 'Score' } }
-    }
-  };
+  // Determine if protein length is valid for 2D view
+  const lengthNum = info && !info.error
+    ? (typeof info.length === 'number' ? info.length : parseInt(info.length, 10))
+    : NaN;
+  const show2D = settings.show2D && info && !info.error && !isNaN(lengthNum) && lengthNum > 0;
 
   return (
     <div>
@@ -157,7 +181,7 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
                       onClick={() => handleStructureClick(s)}
                       style={{ cursor: 'pointer' }}
                     >
-                      {s.pdb_id || s.model_id} – {s.description}
+                      {s.pdb_id !== 'N/A' ? s.pdb_id : `Model ${s.model_id}`} – {s.method || s.description}
                     </li>
                   ))
                 ) : (
@@ -167,14 +191,31 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
             </div>
           ) : (
             <div>
-              <p className="text-danger">{info?.error || 'Enter a gene symbol to view structures'}</p>
+              {info?.error ? (
+                <div className="alert alert-danger">
+                  {info.error}
+                  {initialGene && initialGene !== 'Unknown' && initialGene !== gene && (
+                    <button
+                      className="btn btn-sm btn-outline-primary ms-2"
+                      onClick={() => {
+                        setGene(initialGene);
+                        fetchStructureInfo(initialGene);
+                      }}
+                    >
+                      Use detected gene: {initialGene}
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <p className="text-muted">Enter a gene symbol to view structures (e.g., Dmd for mouse dystrophin)</p>
+              )}
             </div>
           )}
           <div className="input-group mt-2">
             <input
               type="text"
               className="form-control"
-              placeholder="Gene (e.g., BRCA1)"
+              placeholder="Gene (e.g., Dmd)"
               value={gene}
               onChange={e => setGene(e.target.value)}
             />
@@ -182,15 +223,48 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
           </div>
         </div>
         <div className="col-md-8">
-          <div
-            ref={viewerRef}
-            style={{ width: '100%', height: '500px', border: '1px solid #ccc', background: '#000' }}
-          />
+          {/* 2D Viewer */}
+          {show2D && (
+            <div className="mb-3">
+              <Protein2DView
+                proteinLength={lengthNum}
+                mutations={mutationDetails}
+                structures={info.structures}
+                uniprotId={info.uniprot_id}
+              />
+            </div>
+          )}
+          {/* 3D Viewer with tooltip */}
+          {settings.show3D && (
+            <div style={{ position: 'relative' }}>
+              <div
+                ref={viewerRef}
+                style={{ width: '100%', height: '500px', border: '1px solid #ccc', background: '#000' }}
+              />
+              {pickedResidue && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    bottom: '10px',
+                    left: '10px',
+                    background: 'rgba(0,0,0,0.7)',
+                    color: 'white',
+                    padding: '4px 8px',
+                    borderRadius: '4px',
+                    pointerEvents: 'none'
+                  }}
+                >
+                  {pickedResidue}
+                </div>
+              )}
+              <small className="text-muted">Click on structure to identify residues</small>
+            </div>
+          )}
         </div>
       </div>
 
       {/* Mutation Details Table */}
-      {mutationDetails.length > 0 && (
+      {settings.showTable && mutationDetails.length > 0 && (
         <div className="mt-4">
           <h5>🧬 Mutation Details</h5>
           <div style={{ overflowX: 'auto' }}>
@@ -216,7 +290,11 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
                     <td>{m.refAA} &gt; {m.altAA}</td>
                     <td><code>{m.refCodon} &gt; {m.patCodon}</code></td>
                     <td><code>{m.contextRef}</code></td>
-                    <td>{m.am_score?.toFixed(4) || 'N/A'}</td>
+                    <td>
+                      {typeof m.am_score === 'number'
+                        ? m.am_score.toFixed(4)
+                        : (m.am_score || 'N/A')}
+                    </td>
                     <td>{m.clinvar || 'N/A'}</td>
                   </tr>
                 ))}
@@ -227,9 +305,9 @@ function StructureTab({ initialGene = '', mutations = [], refSeq = '', patientSe
       )}
 
       {/* Mutation Graph */}
-      {mutationDetails.length > 0 && (
-        <div className="mt-4" style={{ height: '300px' }}>
-          <Bar data={chartData} options={chartOptions} />
+      {settings.showGraph && mutationDetails.length > 0 && (
+        <div className="mt-4">
+          <MutationGraph mutations={mutationDetails} />
         </div>
       )}
 
