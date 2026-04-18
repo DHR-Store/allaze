@@ -100,12 +100,10 @@ function AnalysisTab({ onAnalysisComplete }) {
   // ── Detect comparison mode ───────────────────────────────────────────────
   const detectMode = useCallback((ref, pat, rType, pType) => {
     if (!ref || !pat) return 'nucleotide';
-    // If types are explicitly known, use that instead of just the ratio
     if (rType === 'cds' && pType === 'cds') return 'nucleotide';
     if (rType === 'genomic' && pType === 'cds') return 'protein';
     if (rType === 'cds' && pType === 'genomic') return 'protein';
     if (rType === 'genomic' && pType === 'genomic') return 'nucleotide';
-    // Fall back to length ratio
     const ratio = ref.length / pat.length;
     if (ratio > 3 || ratio < 0.33) return 'protein';
     return 'nucleotide';
@@ -115,8 +113,6 @@ function AnalysisTab({ onAnalysisComplete }) {
     ? detectMode(refSeq, patientSeq, refSeqType, patSeqType)
     : '';
 
-  // ── Genomic mismatch warning ─────────────────────────────────────────────
-  // True when one file is mRNA and the other is genomic (intron-containing).
   const isSeqTypeMismatch =
     refSeqType && patSeqType &&
     ((refSeqType === 'cds' && patSeqType === 'genomic') ||
@@ -142,7 +138,7 @@ function AnalysisTab({ onAnalysisComplete }) {
       let variants = [];
 
       // ══════════════════════════════════════════════════════════════════════
-      // PROTEIN MODE  — sequences are incompatible (different types/lengths)
+      // PROTEIN MODE
       // ══════════════════════════════════════════════════════════════════════
       if (compMode === 'protein') {
 
@@ -155,8 +151,6 @@ function AnalysisTab({ onAnalysisComplete }) {
           setLog('⚗️ Sequences have very different lengths. Switching to protein comparison mode…');
         }
 
-        // Step 1 – Determine which sequence is the "patient CDS"
-        // If patient is genomic, we have to extract the best ORF
         let patientProtein;
 
         if (patSeqType === 'genomic') {
@@ -168,10 +162,8 @@ function AnalysisTab({ onAnalysisComplete }) {
           const { protein: orfProtein } = findBestORF(patientSeq);
           patientProtein = orfProtein;
         } else if (refSeqType === 'genomic') {
-          // Reference is genomic, patient is CDS — translate the patient CDS directly
           patientProtein = extractProtein(patientSeq);
         } else {
-          // Both unknown/cds — translate patient directly
           patientProtein = extractProtein(patientSeq);
         }
 
@@ -182,7 +174,6 @@ function AnalysisTab({ onAnalysisComplete }) {
           return;
         }
 
-        // Step 2 – Identify gene (BLAST if still unknown)
         if (gene === 'Unknown') {
           setLog('🔍 Gene unknown – running BLAST to identify…');
           try {
@@ -208,7 +199,6 @@ function AnalysisTab({ onAnalysisComplete }) {
           setLog(`🧬 Fetching canonical ${gene} protein from UniProt…`);
         }
 
-        // Step 3 – Fetch canonical reference protein from UniProt
         const isMouseOrganism =
           organism.toLowerCase().includes('mus') || organism.toLowerCase().includes('mouse');
         const refProtein = await getCanonicalProtein(gene, isMouseOrganism ? 'mouse' : 'human');
@@ -228,7 +218,6 @@ function AnalysisTab({ onAnalysisComplete }) {
           'Comparing…'
         );
 
-        // Step 4 – Compare proteins
         const aaVariants = compareProteins(refProtein, patientProtein);
 
         if (aaVariants.length === 0) {
@@ -237,7 +226,6 @@ function AnalysisTab({ onAnalysisComplete }) {
           return;
         }
 
-        // Build variant objects (protein-mode shape)
         variants = aaVariants.map(v => ({
           position:         v.aaPos,
           reference_allele: v.refAA,
@@ -257,7 +245,7 @@ function AnalysisTab({ onAnalysisComplete }) {
         setLog(`Found ${variants.length} amino acid variant(s). Querying pathogenicity APIs…`);
 
       // ══════════════════════════════════════════════════════════════════════
-      // NUCLEOTIDE MODE  — sequences are compatible lengths / same type
+      // NUCLEOTIDE MODE
       // ══════════════════════════════════════════════════════════════════════
       } else {
         setLog('🧬 Starting nucleotide-level analysis…');
@@ -270,12 +258,12 @@ function AnalysisTab({ onAnalysisComplete }) {
             const altAllele = patientSeq[i];
             const aaChange  = getAminoAcidChange(refSeq, patientSeq, i + 1, refAllele, altAllele);
             rawVariants.push({
-              position:         i + 1,
+              position:         i + 1,           // nucleotide position (1-based)
               reference_allele: refAllele,
               alternate_allele: altAllele,
               gene,
               organism,
-              aaPos:    aaChange.aaPos,
+              aaPos:    aaChange.aaPos,           // amino acid position
               refAA:    aaChange.refAA,
               patAA:    aaChange.patAA,
               refCodon: aaChange.refCodon,
@@ -505,9 +493,12 @@ function AnalysisTab({ onAnalysisComplete }) {
             <table className="table table-bordered table-sm table-hover align-middle">
               <thead className="table-dark">
                 <tr>
-                  <th>{mode === 'protein' ? 'AA Pos' : 'Nt Pos'}</th>
-                  <th>Ref AA</th>
-                  <th>Alt AA</th>
+                  {/* In nucleotide mode: show both nt pos and aa pos columns */}
+                  {mode !== 'protein' && <th>Nt Pos</th>}
+                  <th>{mode === 'protein' ? 'AA Pos' : 'AA Pos'}</th>
+                  <th>Ref Base</th>
+                  <th>Alt Base</th>
+                  <th>AA Change</th>
                   <th>Gene</th>
                   <th>Organism</th>
                   <th>AM Score</th>
@@ -525,15 +516,30 @@ function AnalysisTab({ onAnalysisComplete }) {
                       v.classification?.includes('Benign')     ? 'table-success' : ''
                     }
                   >
-                    <td>{v.aaPos ?? v.position ?? '—'}</td>
+                    {/* Nucleotide position column (nucleotide mode only) */}
+                    {mode !== 'protein' && (
+                      <td className="text-muted" style={{ fontSize: '0.85em' }}>
+                        {v.position ?? '—'}
+                      </td>
+                    )}
+                    {/* Amino acid position */}
+                    <td><strong>{v.aaPos ?? v.position ?? '—'}</strong></td>
+                    {/* Reference base/AA */}
                     <td><strong>{v.reference_allele}</strong></td>
+                    {/* Alternate base/AA */}
                     <td><strong>{v.alternate_allele}</strong></td>
+                    {/* AA change summary */}
+                    <td>
+                      {v.refAA && v.patAA
+                        ? <code>{v.refAA}{v.aaPos}{v.patAA}</code>
+                        : '—'}
+                    </td>
                     <td>{v.gene}</td>
                     <td><em>{v.organism}</em></td>
                     <td>
                       {typeof v.am_score === 'number'
-                        ? v.am_score.toFixed(4)
-                        : v.am_score}
+                        ? <strong>{v.am_score.toFixed(4)}</strong>
+                        : <span className="text-muted">{v.am_score}</span>}
                     </td>
                     <td>
                       <span className={`badge ${
@@ -547,7 +553,7 @@ function AnalysisTab({ onAnalysisComplete }) {
                       </span>
                     </td>
                     <td>{v.clinvar}</td>
-                    <td>{v.disease}</td>
+                    <td style={{ maxWidth: 200, fontSize: '0.85em' }}>{v.disease}</td>
                   </tr>
                 ))}
               </tbody>
